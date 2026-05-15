@@ -1,11 +1,8 @@
 <h1 align="center">ADA-L</h1>
 <p align="center">
-  <em>Adaptive Domain-Aware Learning for Robot Trajectory Optimization</em>
-</p>
-
-<p align="center">
-  <img alt="Python" src="https://img.shields.io/badge/python-3.9%2B-blue">
-  <img alt="TensorFlow" src="https://img.shields.io/badge/tensorflow-2.13%2B-orange">
+  <strong>Manufacturing-Task-Specific Trajectory Planning via Latent Acceleration Panel Representation</strong>
+  <br>
+  <sub><em>ADA-L = Anti-derivatives Approximator from Legendre polynomials</em></sub>
 </p>
 
 This repository contains the source code accompanying the paper.
@@ -13,6 +10,8 @@ It includes the proposed **ADA-L** planner together with baseline
 planners (**Quintic**, **Direct transcription**, **B-spline**),
 all evaluated on a UR5e 6-DoF arm in both **simulation** and on
 **real hardware**.
+
+**Requirements:** Python 3.9+, TensorFlow 2.13+. See [`requirements.txt`](requirements.txt).
 
 ---
 
@@ -256,5 +255,3 @@ Remove the leading `# ` from every line in the block.
 - **`capsule_collision_checker.py`** — used only by Experiments 3 and
   4. A copy is shipped inside each of those directories so the scripts
   remain self-contained.
-
----
