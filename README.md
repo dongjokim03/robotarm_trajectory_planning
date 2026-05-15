@@ -6,7 +6,6 @@
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/python-3.9%2B-blue">
   <img alt="TensorFlow" src="https://img.shields.io/badge/tensorflow-2.13%2B-orange">
-  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 This repository contains the source code accompanying the paper.
@@ -26,7 +25,6 @@ all evaluated on a UR5e 6-DoF arm in both **simulation** and on
 - [Output format](#output-format)
 - [Optional: MP4 animation export](#optional-mp4-animation-export)
 - [Other utilities](#other-utilities)
-- [License](#license)
 
 ---
 
@@ -260,7 +258,3 @@ Remove the leading `# ` from every line in the block.
   remain self-contained.
 
 ---
-
-## License
-
-See [`LICENSE`](LICENSE).
