@@ -1,7 +1,6 @@
 <h1 align="center">ADA-L</h1>
 <p align="center">
-  <strong>Task-Specific Acceleration-Domain Trajectory Optimization for Smooth
-    \\and Energy-Efficient Industrial Manipulator Motion</strong>
+  <strong>Task-Specific Acceleration-Domain Trajectory Optimization for Smooth and Energy-Efficient Industrial Manipulator Motion</strong>
   <br>
   <sub><em>ADA-L = Anti-derivatives Approximator from Legendre polynomials</em></sub>
 </p>
