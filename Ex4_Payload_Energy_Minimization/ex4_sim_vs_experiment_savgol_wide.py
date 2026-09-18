@@ -624,6 +624,65 @@ def write_exp_report_docx(docx_path,
 # ============================================================
 # Main
 # ============================================================
+# ============================================================
+# Payload gravity torque (completes the UR-logged target_moment)
+# ============================================================
+# The UR controller's logged `target_moment` is a model-based feed-forward that
+# does NOT include the externally attached payload (the controller model is not
+# configured with it), whereas the simulated surrogate torque does. We therefore
+# add the analytic payload gravity torque so the experimental torque and
+# mechanical power are on the same basis as the simulation. The payload is a
+# point mass at PAYLOAD_COM_LOCAL in the tool frame; the gravity torque is the
+# geometric-Jacobian term tau_g = -J_v(q)^T (m g), identical to the surrogate
+# model used to generate the simulation (PayloadAwareJointDynamics).
+_ALPHA_DH = np.array([np.pi / 2, 0.0, 0.0, np.pi / 2, -np.pi / 2, 0.0])
+_A_DH     = np.array([0.0, -0.425, -0.3922, 0.0, 0.0, 0.0])
+_D_DH     = np.array([0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996])
+PAYLOAD_MASS = 3.0
+PAYLOAD_COM_LOCAL = np.array([0.0, 0.0, 0.0875])   # tool frame (payload_3kg_centered)
+GRAVITY_VEC = np.array([0.0, 0.0, -9.81])
+
+
+def _dh_np(alpha, a, d, theta):
+    ca, sa = np.cos(alpha), np.sin(alpha)
+    ct, st = np.cos(theta), np.sin(theta)                 # theta: [N]
+    n = theta.shape[0]
+    T = np.zeros((n, 4, 4))
+    T[:, 0, 0] = ct; T[:, 0, 1] = -st * ca; T[:, 0, 2] = st * sa;  T[:, 0, 3] = a * ct
+    T[:, 1, 0] = st; T[:, 1, 1] = ct * ca;  T[:, 1, 2] = -ct * sa; T[:, 1, 3] = a * st
+    T[:, 2, 1] = sa; T[:, 2, 2] = ca;       T[:, 2, 3] = d
+    T[:, 3, 3] = 1.0
+    return T
+
+
+def payload_gravity_torque(q_robot):
+    """Joint gravity torque produced by the external payload only.
+
+    q_robot : [N,6] measured robot-convention joint angles (actual_q). The DH
+    transform uses theta_i = q_robot[:, i] directly (the theta_offset is already
+    contained in the robot-convention angle, so it is NOT re-added here).
+    Returns tau_payload [N,6] = -J_v^payload(q)^T (m_payload g).
+    """
+    q = np.asarray(q_robot, dtype=float)
+    n = q.shape[0]
+    T = np.broadcast_to(np.eye(4), (n, 4, 4)).copy()
+    z = [T[:, :3, 2].copy()]
+    o = [T[:, :3, 3].copy()]
+    R = [T[:, :3, :3].copy()]
+    for i in range(6):
+        T = T @ _dh_np(_ALPHA_DH[i], _A_DH[i], _D_DH[i], q[:, i])
+        z.append(T[:, :3, 2].copy())
+        o.append(T[:, :3, 3].copy())
+        R.append(T[:, :3, :3].copy())
+    p_payload = o[6] + np.einsum("nij,j->ni", R[6], PAYLOAD_COM_LOCAL)
+    F_g = PAYLOAD_MASS * GRAVITY_VEC
+    tau = np.zeros((n, 6))
+    for i in range(6):
+        J_vi = np.cross(z[i], p_payload - o[i])           # [N,3]
+        tau[:, i] = -np.sum(J_vi * F_g[None, :], axis=1)
+    return tau
+
+
 def main():
     sim_adal_csv     = SIM_DIR / "ADAL_trajectory_full.csv"
     sim_bspline_csv = SIM_DIR / "Bspline_trajectory_full.csv"
@@ -641,6 +700,17 @@ def main():
     (t_qe, q_qe, qd_qe, qdd_qe, qj_qe,
      tau_qe, pe_qe, pm_qe,
      tau_qe_raw, pe_qe_raw, pm_qe_raw) = load_experiment_csv_savgol(EXP_BSPLINE_CSV)
+
+    # Complete the experimental torque/power with the payload gravity that the
+    # UR-logged target_moment omits, so exp and sim share the same 3 kg-payload
+    # basis (see payload_gravity_torque above). Mechanical power adds the payload
+    # gravity power tau_payload * qdot.
+    pg_le = payload_gravity_torque(q_le)
+    pg_qe = payload_gravity_torque(q_qe)
+    tau_le = tau_le + pg_le;  tau_le_raw = tau_le_raw + pg_le
+    tau_qe = tau_qe + pg_qe;  tau_qe_raw = tau_qe_raw + pg_qe
+    pm_le = pm_le + pg_le * qd_le;  pm_le_raw = pm_le_raw + pg_le * qd_le
+    pm_qe = pm_qe + pg_qe * qd_qe;  pm_qe_raw = pm_qe_raw + pg_qe * qd_qe
 
     print(f"[sim/ADA-L]     N={len(t_ls)}, t in [{t_ls[0]:.3f}, {t_ls[-1]:.3f}] s")
     print(f"[sim/Bspline] N={len(t_qs)}, t in [{t_qs[0]:.3f}, {t_qs[-1]:.3f}] s")
