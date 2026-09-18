@@ -32,42 +32,164 @@ Implementation notes
   Coriolis/centrifugal term uses Christoffel symbols with dM/dq by central
   finite differences of M(q), so gradients flow for the L-BFGS optimizer.
 * On start-up a one-shot numeric check confirms the TensorFlow torque matches
-  the reference numpy model (coriolis_analysis.py) on the ADA-L trajectory.
+  the inlined reference numpy rigid-body model on the ADA-L trajectory.
 
 Run:  python ex4_fullmodel_adal.py
 """
 
 import os
 import sys
+import csv
+import glob
 import json
 import importlib.util
 import numpy as np
 import tensorflow as tf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# paper figure style (matches the Ex4 report figures)
+plt.rcParams.update({
+    "font.family": "Arial", "font.size": 14, "axes.titlesize": 14,
+    "axes.labelsize": 14, "xtick.labelsize": 14, "ytick.labelsize": 14,
+    "legend.fontsize": 12, "savefig.dpi": 300,
+})
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-# validated numpy reference + shared UR5e parameters (float64)
-import coriolis_analysis as ref
-from coriolis_analysis import (
-    ALPHA, A_DH, D_DH, THETA_OFFSET, LINK_MASS, LINK_COM, LINK_INERTIA,
-)
+# ============================================================
+# Reference numpy UR5e rigid-body dynamics (float64), inlined so this script
+# is self-contained. Parameters: UR official DH / link mass / COM; link inertia
+# negligible (only link-6 izz); viscous friction D from Clochiatti et al. (2024).
+# Used for the start-up numeric check and the post-hoc surrogate-cost comparison.
+# ============================================================
+DTYPE_NP = np.float64
+G_VEC = np.array([0.0, 0.0, -9.81], dtype=DTYPE_NP)
+ALPHA = np.array([np.pi / 2, 0.0, 0.0, np.pi / 2, -np.pi / 2, 0.0], dtype=DTYPE_NP)
+A_DH = np.array([0.0, -0.425, -0.3922, 0.0, 0.0, 0.0], dtype=DTYPE_NP)
+D_DH = np.array([0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996], dtype=DTYPE_NP)
+THETA_OFFSET = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0], dtype=DTYPE_NP)
+LINK_MASS = np.array([3.761, 8.058, 2.846, 1.37, 1.3, 0.365], dtype=DTYPE_NP)
+LINK_COM = np.array([
+    [0.0, -0.02561, 0.00193], [0.2125, 0.0, 0.11336], [0.15, 0.0, 0.0265],
+    [0.0, -0.0018, 0.01634], [0.0, 0.0018, 0.01634], [0.0, 0.0, -0.001159],
+], dtype=DTYPE_NP)
+LINK_INERTIA = np.zeros((6, 3, 3), dtype=DTYPE_NP)
+LINK_INERTIA[5, 2, 2] = 0.0002
+D_VISC = np.array([4.75, 10.73, 3.82, 2.95, 1.14, 1.88], dtype=DTYPE_NP)
+PAYLOAD_MASS = 3.0
+PAYLOAD_COM_LOCAL = np.array([0.0, 0.0, 0.0875], dtype=DTYPE_NP)
 
-# ---- load the Ex4 module (filename starts with a digit -> importlib) ----
-EX4_PATH = os.path.join(
-    os.path.dirname(HERE),
-    "Ex4_Payload_Energy_Minimization",
-    "260409_ex4_bspline_v3_coll.py",
-)
-# put the Ex4 folder on the path so its sibling modules (e.g.
-# capsule_collision_checker, imported lazily inside validate_collision) resolve
-sys.path.insert(0, os.path.dirname(EX4_PATH))
+
+def load_trajectory(csv_path):
+    """time, q(robot conv.), qdot, qddot, tau(surrogate) from a trajectory CSV."""
+    rows = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        for r in reader:
+            if r:
+                rows.append([float(x) for x in r])
+    data = np.array(rows, dtype=DTYPE_NP)
+    col = {name: i for i, name in enumerate(header)}
+    t = data[:, col["time"]]
+    q = np.stack([data[:, col[f"q{j}"]] for j in range(1, 7)], axis=1)
+    qdot = np.stack([data[:, col[f"qdot{j}"]] for j in range(1, 7)], axis=1)
+    qddot = np.stack([data[:, col[f"qddot{j}"]] for j in range(1, 7)], axis=1)
+    tau = np.stack([data[:, col[f"tau{j}"]] for j in range(1, 7)], axis=1)
+    return t, q, qdot, qddot, tau
+
+
+def dh_transform(alpha, a, d, theta):
+    N = theta.shape[0]
+    ca, sa = np.cos(alpha), np.sin(alpha)
+    ct, st = np.cos(theta), np.sin(theta)
+    T = np.zeros((N, 4, 4), dtype=DTYPE_NP)
+    T[:, 0, 0] = ct; T[:, 0, 1] = -st * ca; T[:, 0, 2] = st * sa; T[:, 0, 3] = a * ct
+    T[:, 1, 0] = st; T[:, 1, 1] = ct * ca;  T[:, 1, 2] = -ct * sa; T[:, 1, 3] = a * st
+    T[:, 2, 1] = sa; T[:, 2, 2] = ca; T[:, 2, 3] = d; T[:, 3, 3] = 1.0
+    return T
+
+
+def fk_frames(q_robot):
+    """q_robot [N,6] robot-convention (theta_i directly). Returns z,o,R (len 7)."""
+    N = q_robot.shape[0]
+    T = np.tile(np.eye(4, dtype=DTYPE_NP), (N, 1, 1))
+    z = [T[:, :3, 2].copy()]; o = [T[:, :3, 3].copy()]; R = [T[:, :3, :3].copy()]
+    for i in range(6):
+        T = np.matmul(T, dh_transform(ALPHA[i], A_DH[i], D_DH[i], q_robot[:, i]))
+        z.append(T[:, :3, 2].copy()); o.append(T[:, :3, 3].copy()); R.append(T[:, :3, :3].copy())
+    return z, o, R
+
+
+def mass_matrix_and_gravity(q_robot):
+    """Full pose-dependent mass matrix [N,6,6] and gravity torque [N,6] (3 kg payload)."""
+    z, o, R = fk_frames(q_robot)
+    N = q_robot.shape[0]
+    M = np.zeros((N, 6, 6), dtype=DTYPE_NP)
+    g = np.zeros((N, 6), dtype=DTYPE_NP)
+    for k in range(6):
+        p_com = o[k + 1] + np.einsum("nij,j->ni", R[k + 1], LINK_COM[k])
+        Jv = np.zeros((N, 3, 6), dtype=DTYPE_NP)
+        Jw = np.zeros((N, 3, 6), dtype=DTYPE_NP)
+        for i in range(k + 1):
+            Jv[:, :, i] = np.cross(z[i], p_com - o[i]); Jw[:, :, i] = z[i]
+        M += LINK_MASS[k] * np.einsum("nai,naj->nij", Jv, Jv)
+        Iw = np.einsum("nab,bc,ndc->nad", R[k + 1], LINK_INERTIA[k], R[k + 1])
+        M += np.einsum("nai,nab,nbj->nij", Jw, Iw, Jw)
+        g += -np.einsum("nai,a->ni", Jv, LINK_MASS[k] * G_VEC)
+    p_pl = o[6] + np.einsum("nij,j->ni", R[6], PAYLOAD_COM_LOCAL)
+    Jv = np.zeros((N, 3, 6), dtype=DTYPE_NP)
+    for i in range(6):
+        Jv[:, :, i] = np.cross(z[i], p_pl - o[i])
+    M += PAYLOAD_MASS * np.einsum("nai,naj->nij", Jv, Jv)
+    g += -np.einsum("nai,a->ni", Jv, PAYLOAD_MASS * G_VEC)
+    M = 0.5 * (M + np.transpose(M, (0, 2, 1)))
+    return M, g
+
+
+def christoffel_tensor(q_robot, h=1e-6):
+    N = q_robot.shape[0]
+    dMdq = np.zeros((N, 6, 6, 6), dtype=DTYPE_NP)
+    for k in range(6):
+        qp = q_robot.copy(); qp[:, k] += h
+        qm = q_robot.copy(); qm[:, k] -= h
+        Mp, _ = mass_matrix_and_gravity(qp)
+        Mm, _ = mass_matrix_and_gravity(qm)
+        dMdq[:, :, :, k] = (Mp - Mm) / (2.0 * h)
+    c = 0.5 * (dMdq + np.transpose(dMdq, (0, 1, 3, 2)) - np.transpose(dMdq, (0, 2, 3, 1)))
+    return c, dMdq
+
+
+def coriolis(q_robot, qdot, h=1e-6):
+    c, dMdq = christoffel_tensor(q_robot, h)
+    Cqd = np.einsum("nijk,nj,nk->ni", c, qdot, qdot)
+    Cmat = np.einsum("nijk,nk->nij", c, qdot)
+    return Cqd, Cmat, dMdq
+
+
+# ---- surrogate-optimized ADA-L results (run 260514_ex4_bspline_vs_ada-l.py first) ----
+def _find_latest_results(prefix):
+    matches = sorted(glob.glob(os.path.join(HERE, f"{prefix}_*")))
+    if not matches:
+        raise FileNotFoundError(
+            f"No '{prefix}_*' results folder in {HERE}. "
+            f"Run 260514_ex4_bspline_vs_ada-l.py first to generate it.")
+    return matches[-1]
+
+
+SIM_DIR = os.path.join(_find_latest_results("results_payload_energy"), "payload_3kg_centered")
+LPA_CSV = os.path.join(SIM_DIR, "ADAL_trajectory_full.csv")
+LPA_METRICS = os.path.join(SIM_DIR, "metrics_adal.json")
+
+# ---- load the Ex4 optimizer module (filename starts with a digit) ----
+EX4_PATH = os.path.join(HERE, "260514_ex4_bspline_vs_ada-l.py")
 _spec = importlib.util.spec_from_file_location("ex4mod", EX4_PATH)
 ex4 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ex4)
 DTYPE = ex4.DTYPE  # tf.float32
-
-import matplotlib.pyplot as plt   # Agg backend + paper rcParams set by coriolis_analysis
 
 OUT_DIR = os.path.join(HERE, "fullmodel_adal_output")
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -175,7 +297,7 @@ def torque_full(self, q, qdot, qddot):
 # one-shot correctness check vs the validated numpy model
 # ============================================================
 def startup_check():
-    t, q_rob, qdot, qddot, _ = ref.load_trajectory(ref.LPA_CSV)
+    t, q_rob, qdot, qddot, _ = load_trajectory(LPA_CSV)
     q_int = q_rob - THETA_OFFSET[None, :]              # internal convention
 
     dyn = ex4.PayloadAwareJointDynamics(
@@ -190,10 +312,10 @@ def startup_check():
                         tf.constant(qddot, DTYPE)).numpy()
 
     # numpy reference (float64) on robot-convention q
-    M, g = ref.mass_matrix_and_gravity(q_rob)
-    Cqd, _, _ = ref.coriolis(q_rob, qdot)
+    M, g = mass_matrix_and_gravity(q_rob)
+    Cqd, _, _ = coriolis(q_rob, qdot)
     Mqdd = np.einsum("nij,nj->ni", M, qddot)
-    tau_np = Mqdd + Cqd + g + ref.D_VISC[None, :] * qdot
+    tau_np = Mqdd + Cqd + g + D_VISC[None, :] * qdot
 
     err = float(np.max(np.abs(tau_tf - tau_np)))
     rel = err / float(np.max(np.abs(tau_np)))
@@ -346,11 +468,18 @@ def main():
     print(f"[figures] ADA-L-only full-model figure set -> {figs}")
 
     # ---- surrogate-optimized trajectory, full-model cost (from post-hoc) ----
-    with open(os.path.join(ref.OUT_DIR, "summary_metrics.json"),
-              "r", encoding="utf-8") as f:
-        posthoc = json.load(f)
-    sur_full = posthoc["cost_metrics"]["full"]
-    with open(ref.LPA_METRICS, "r", encoding="utf-8") as f:
+    # surrogate-optimized ADA-L trajectory, evaluated under the FULL model
+    # (inlined post-hoc; replaces the external coriolis_analysis summary).
+    ts, qs, qds, qdds, _ = load_trajectory(LPA_CSV)
+    Ms, gs = mass_matrix_and_gravity(qs)
+    Cs, _, _ = coriolis(qs, qds)
+    tau_s = np.einsum("nij,nj->ni", Ms, qdds) + Cs + gs + D_VISC[None, :] * qds
+    dts = float((ts[-1] - ts[0]) / (len(ts) - 1))
+    sur_full = {
+        "integrated_squared_torque": float(np.sum(np.sum(tau_s ** 2, axis=1)) * dts),
+        "integrated_joint_abs_work": float(np.sum(np.sum(np.abs(tau_s * qds), axis=1)) * dts),
+    }
+    with open(LPA_METRICS, "r", encoding="utf-8") as f:
         paper = json.load(f)
 
     print("\n" + "=" * 68)
